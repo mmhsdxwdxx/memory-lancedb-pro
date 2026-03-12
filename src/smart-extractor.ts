@@ -27,7 +27,7 @@ import {
 } from "./memory-categories.js";
 import { isNoise } from "./noise-filter.js";
 import type { NoisePrototypeBank } from "./noise-prototypes.js";
-import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats } from "./smart-metadata.js";
 
 // ============================================================================
 // Constants
@@ -36,7 +36,7 @@ import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "
 const SIMILARITY_THRESHOLD = 0.7;
 const MAX_SIMILAR_FOR_PROMPT = 3;
 const MAX_MEMORIES_PER_EXTRACTION = 5;
-const VALID_DECISIONS = new Set<string>(["create", "merge", "skip"]);
+const VALID_DECISIONS = new Set<string>(["create", "merge", "skip", "support", "contextualize", "contradict"]);
 
 // ============================================================================
 // Smart Extractor
@@ -341,6 +341,7 @@ export class SmartExtractor {
             dedupResult.matchId,
             scopeFilter,
             targetScope,
+            dedupResult.contextLabel,
           );
           stats.merged++;
         } else {
@@ -355,6 +356,36 @@ export class SmartExtractor {
           `memory-pro: smart-extractor: skipped [${candidate.category}] ${candidate.abstract.slice(0, 60)}`,
         );
         stats.skipped++;
+        break;
+
+      case "support":
+        if (dedupResult.matchId) {
+          await this.handleSupport(dedupResult.matchId, scopeFilter, { session: sessionKey, timestamp: Date.now() }, dedupResult.reason, dedupResult.contextLabel);
+          stats.supported = (stats.supported ?? 0) + 1;
+        } else {
+          await this.storeCandidate(candidate, vector, sessionKey, targetScope);
+          stats.created++;
+        }
+        break;
+
+      case "contextualize":
+        if (dedupResult.matchId) {
+          await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel);
+          stats.created++;
+        } else {
+          await this.storeCandidate(candidate, vector, sessionKey, targetScope);
+          stats.created++;
+        }
+        break;
+
+      case "contradict":
+        if (dedupResult.matchId) {
+          await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel);
+          stats.created++;
+        } else {
+          await this.storeCandidate(candidate, vector, sessionKey, targetScope);
+          stats.created++;
+        }
         break;
     }
   }
@@ -445,7 +476,8 @@ export class SmartExtractor {
       return {
         decision,
         reason: data.reason ?? "",
-        matchId: decision === "merge" ? matchEntry?.entry.id : undefined,
+        matchId: ["merge", "support", "contextualize", "contradict"].includes(decision) ? matchEntry?.entry.id : undefined,
+        contextLabel: typeof (data as any).context_label === "string" ? (data as any).context_label : undefined,
       };
     } catch (err) {
       this.log(
@@ -509,6 +541,7 @@ export class SmartExtractor {
     matchId: string,
     scopeFilter: string[],
     targetScope: string,
+    contextLabel?: string,
   ): Promise<void> {
     let existingAbstract = "";
     let existingOverview = "";
@@ -588,8 +621,154 @@ export class SmartExtractor {
       scopeFilter,
     );
 
+    // Update support stats on the merged memory
+    try {
+      const updatedEntry = await this.store.getById(matchId, scopeFilter);
+      if (updatedEntry) {
+        const meta = parseSmartMetadata(updatedEntry.metadata, updatedEntry);
+        const supportInfo = parseSupportInfo(meta.support_info);
+        const updated = updateSupportStats(supportInfo, contextLabel, "support");
+        const finalMetadata = stringifySmartMetadata({ ...meta, support_info: updated });
+        await this.store.update(matchId, { metadata: finalMetadata }, scopeFilter);
+      }
+    } catch {
+      // Non-critical: merge succeeded, support stats update is best-effort
+    }
+
     this.log(
-      `memory-pro: smart-extractor: merged [${candidate.category}] into ${matchId.slice(0, 8)}`,
+      `memory-pro: smart-extractor: merged [${candidate.category}]${contextLabel ? ` [${contextLabel}]` : ""} into ${matchId.slice(0, 8)}`,
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Context-Aware Handlers (support / contextualize / contradict)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Handle SUPPORT: update support stats on existing memory for a specific context.
+   */
+  private async handleSupport(
+    matchId: string,
+    scopeFilter: string[],
+    source: { session: string; timestamp: number },
+    reason: string,
+    contextLabel?: string,
+  ): Promise<void> {
+    const existing = await this.store.getById(matchId, scopeFilter);
+    if (!existing) return;
+
+    const meta = parseSmartMetadata(existing.metadata, existing);
+    const supportInfo = parseSupportInfo(meta.support_info);
+    const updated = updateSupportStats(supportInfo, contextLabel, "support");
+    meta.support_info = updated;
+
+    await this.store.update(
+      matchId,
+      { metadata: stringifySmartMetadata(meta) },
+      scopeFilter,
+    );
+
+    this.log(
+      `memory-pro: smart-extractor: support [${contextLabel || "general"}] on ${matchId.slice(0, 8)} — ${reason}`,
+    );
+  }
+
+  /**
+   * Handle CONTEXTUALIZE: create a new entry that adds situational nuance,
+   * linked to the original via a relation in metadata.
+   */
+  private async handleContextualize(
+    candidate: CandidateMemory,
+    vector: number[],
+    matchId: string,
+    sessionKey: string,
+    targetScope: string,
+    scopeFilter: string[],
+    contextLabel?: string,
+  ): Promise<void> {
+    const storeCategory = this.mapToStoreCategory(candidate.category);
+    const metadata = stringifySmartMetadata({
+      l0_abstract: candidate.abstract,
+      l1_overview: candidate.overview,
+      l2_content: candidate.content,
+      memory_category: candidate.category,
+      tier: "working" as const,
+      access_count: 0,
+      confidence: 0.7,
+      last_accessed_at: Date.now(),
+      source_session: sessionKey,
+      contexts: contextLabel ? [contextLabel] : [],
+      relations: [{ type: "contextualizes", targetId: matchId }],
+    });
+
+    await this.store.store({
+      text: candidate.abstract,
+      vector,
+      category: storeCategory,
+      scope: targetScope,
+      importance: this.getDefaultImportance(candidate.category),
+      metadata,
+    });
+
+    this.log(
+      `memory-pro: smart-extractor: contextualize [${contextLabel || "general"}] new entry linked to ${matchId.slice(0, 8)}`,
+    );
+  }
+
+  /**
+   * Handle CONTRADICT: create contradicting entry + record contradiction evidence
+   * on the original memory's support stats.
+   */
+  private async handleContradict(
+    candidate: CandidateMemory,
+    vector: number[],
+    matchId: string,
+    sessionKey: string,
+    targetScope: string,
+    scopeFilter: string[],
+    contextLabel?: string,
+  ): Promise<void> {
+    // 1. Record contradiction on the existing memory
+    const existing = await this.store.getById(matchId, scopeFilter);
+    if (existing) {
+      const meta = parseSmartMetadata(existing.metadata, existing);
+      const supportInfo = parseSupportInfo(meta.support_info);
+      const updated = updateSupportStats(supportInfo, contextLabel, "contradict");
+      meta.support_info = updated;
+      await this.store.update(
+        matchId,
+        { metadata: stringifySmartMetadata(meta) },
+        scopeFilter,
+      );
+    }
+
+    // 2. Store the contradicting entry as a new memory
+    const storeCategory = this.mapToStoreCategory(candidate.category);
+    const metadata = stringifySmartMetadata({
+      l0_abstract: candidate.abstract,
+      l1_overview: candidate.overview,
+      l2_content: candidate.content,
+      memory_category: candidate.category,
+      tier: "working" as const,
+      access_count: 0,
+      confidence: 0.7,
+      last_accessed_at: Date.now(),
+      source_session: sessionKey,
+      contexts: contextLabel ? [contextLabel] : [],
+      relations: [{ type: "contradicts", targetId: matchId }],
+    });
+
+    await this.store.store({
+      text: candidate.abstract,
+      vector,
+      category: storeCategory,
+      scope: targetScope,
+      importance: this.getDefaultImportance(candidate.category),
+      metadata,
+    });
+
+    this.log(
+      `memory-pro: smart-extractor: contradict [${contextLabel || "general"}] on ${matchId.slice(0, 8)}, new entry created`,
     );
   }
 

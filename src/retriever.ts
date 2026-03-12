@@ -80,8 +80,8 @@ export interface RetrievalContext {
   limit: number;
   scopeFilter?: string[];
   category?: string;
-  /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated. */
-  source?: "manual" | "auto-recall";
+  /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
+  source?: "manual" | "auto-recall" | "cli";
 }
 
 export interface RetrievalResult extends MemorySearchResult {

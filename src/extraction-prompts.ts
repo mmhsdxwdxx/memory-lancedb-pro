@@ -149,20 +149,26 @@ Please decide:
 - SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
 - CREATE: This is completely new information not covered by any existing memory, should be created
 - MERGE: Candidate memory adds genuinely NEW details to an existing memory and should be merged
+- SUPPORT: Candidate reinforces/confirms an existing memory in a specific context (e.g. "still prefers tea in the evening")
+- CONTEXTUALIZE: Candidate adds a situational nuance to an existing memory (e.g. existing: "likes coffee", candidate: "prefers tea at night" — different context, same topic)
+- CONTRADICT: Candidate directly contradicts an existing memory in a specific context (e.g. existing: "runs on weekends", candidate: "stopped running on weekends")
 
 IMPORTANT:
-- "events" and "cases" categories are independent records — they do NOT support MERGE. For these categories, only use SKIP or CREATE.
+- "events" and "cases" categories are independent records — they do NOT support MERGE/SUPPORT/CONTEXTUALIZE/CONTRADICT. For these categories, only use SKIP or CREATE.
 - If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
 - A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
+- For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
 
 Return JSON format:
 {
-  "decision": "skip|create|merge",
+  "decision": "skip|create|merge|support|contextualize|contradict",
   "match_index": 1,
-  "reason": "Decision reason"
+  "reason": "Decision reason",
+  "context_label": "evening"
 }
 
-If decision is "merge", set "match_index" to the number of the existing memory to merge with (1-based).`;
+- If decision is "merge"/"support"/"contextualize"/"contradict", set "match_index" to the number of the existing memory (1-based).
+- Only include "context_label" for support/contextualize/contradict decisions.`;
 }
 
 export function buildMergePrompt(
@@ -176,32 +182,32 @@ export function buildMergePrompt(
 ): string {
   return `Merge the following memory into a single coherent record with all three levels.
 
-**Category**: ${category}
+** Category **: ${category}
 
-**Existing Memory:**
-Abstract: ${existingAbstract}
-Overview:
+** Existing Memory:**
+    Abstract: ${existingAbstract}
+  Overview:
 ${existingOverview}
-Content:
+  Content:
 ${existingContent}
 
-**New Information:**
-Abstract: ${newAbstract}
-Overview:
+** New Information:**
+    Abstract: ${newAbstract}
+  Overview:
 ${newOverview}
-Content:
+  Content:
 ${newContent}
 
-Requirements:
-- Remove duplicate information
-- Keep the most up-to-date details
-- Maintain a coherent narrative
-- Keep code identifiers / URIs / model names unchanged when they are proper nouns
+  Requirements:
+  - Remove duplicate information
+    - Keep the most up - to - date details
+      - Maintain a coherent narrative
+        - Keep code identifiers / URIs / model names unchanged when they are proper nouns
 
 Return JSON:
-{
-  "abstract": "Merged one-line abstract",
-  "overview": "Merged structured Markdown overview",
-  "content": "Merged full content"
-}`;
+  {
+    "abstract": "Merged one-line abstract",
+      "overview": "Merged structured Markdown overview",
+        "content": "Merged full content"
+  } `;
 }

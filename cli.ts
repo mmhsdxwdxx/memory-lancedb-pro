@@ -83,6 +83,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
       limit,
       scopeFilter,
       category,
+      source: "cli",
     });
 
     if (results.length === 0 && context.embedder) {
@@ -92,6 +93,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         limit,
         scopeFilter,
         category,
+        source: "cli",
       });
     }
 
@@ -417,10 +419,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             const categoryRaw = memory.category;
             const category: MemoryEntry["category"] =
               categoryRaw === "preference" ||
-              categoryRaw === "fact" ||
-              categoryRaw === "decision" ||
-              categoryRaw === "entity" ||
-              categoryRaw === "other"
+                categoryRaw === "fact" ||
+                categoryRaw === "decision" ||
+                categoryRaw === "entity" ||
+                categoryRaw === "other"
                 ? categoryRaw
                 : "other";
 
@@ -531,10 +533,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         let targetReal = context.store.dbPath;
         try {
           sourceReal = await fs.realpath(sourceDbPath);
-        } catch {}
+        } catch { }
         try {
           targetReal = await fs.realpath(context.store.dbPath);
-        } catch {}
+        } catch { }
 
         if (!force && sourceReal === targetReal) {
           console.error("Refusing to re-embed in-place: source-db equals target dbPath. Use a new dbPath or pass --force.");
@@ -778,6 +780,27 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         }
       } catch (error) {
         console.error("Verification failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // reindex-fts: Rebuild FTS index
+  program
+    .command("reindex-fts")
+    .description("Rebuild the BM25 full-text search index")
+    .action(async () => {
+      try {
+        const status = context.store.getFtsStatus();
+        console.log(`FTS status before: available=${status.available}, lastError=${status.lastError || "none"}`);
+        const result = await context.store.rebuildFtsIndex();
+        if (result.success) {
+          console.log("✅ FTS index rebuilt successfully");
+        } else {
+          console.error("❌ FTS rebuild failed:", result.error);
+          process.exit(1);
+        }
+      } catch (error) {
+        console.error("FTS rebuild error:", error);
         process.exit(1);
       }
     });

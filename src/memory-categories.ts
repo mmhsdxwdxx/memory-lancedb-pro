@@ -44,18 +44,20 @@ export type CandidateMemory = {
 };
 
 /** Dedup decision from LLM. */
-export type DedupDecision = "create" | "merge" | "skip";
+export type DedupDecision = "create" | "merge" | "skip" | "support" | "contextualize" | "contradict";
 
 export type DedupResult = {
   decision: DedupDecision;
   reason: string;
   matchId?: string; // ID of existing memory to merge with
+  contextLabel?: string; // Optional context label for support/contextualize/contradict
 };
 
 export type ExtractionStats = {
   created: number;
   merged: number;
   skipped: number;
+  supported?: number; // context-aware support count
 };
 
 /** Validate and normalize a category string. */
