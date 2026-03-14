@@ -483,18 +483,22 @@ export class MemoryStore {
     query: string,
     limit = 5,
     scopeFilter?: string[],
+    options?: { excludeInactive?: boolean },
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     const safeLimit = clampInt(limit, 1, 20);
+    const inactiveFilter = options?.excludeInactive ?? false;
+    // Over-fetch when filtering inactive records to avoid crowding
+    const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
 
     if (!this.ftsIndexCreated) {
-      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     }
 
     try {
       // Use FTS query type explicitly
-      let searchQuery = this.table!.search(query, "fts").limit(safeLimit);
+      let searchQuery = this.table!.search(query, "fts").limit(fetchLimit);
 
       // Apply scope filter if provided
       if (scopeFilter && scopeFilter.length > 0) {
@@ -527,8 +531,7 @@ export class MemoryStore {
         const normalizedScore =
           rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
 
-        mapped.push({
-          entry: {
+        const entry: MemoryEntry = {
             id: row.id as string,
             text: row.text as string,
             vector: row.vector as number[],
@@ -537,22 +540,29 @@ export class MemoryStore {
             importance: Number(row.importance),
             timestamp: Number(row.timestamp),
             metadata: (row.metadata as string) || "{}",
-          },
-          score: normalizedScore,
-        });
+        };
+
+        // Skip inactive (superseded) records when requested
+        if (inactiveFilter && !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))) {
+          continue;
+        }
+
+        mapped.push({ entry, score: normalizedScore });
+
+        if (mapped.length >= safeLimit) break;
       }
 
       if (mapped.length > 0) {
         return mapped;
       }
-      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     } catch (err) {
       console.warn("BM25 search failed, falling back to empty results:", err);
-      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     }
   }
 
-  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[]): Promise<MemorySearchResult[]> {
+  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
     const trimmedQuery = query.trim();
     if (!trimmedQuery) return [];
 
@@ -595,6 +605,12 @@ export class MemoryStore {
       };
 
       const metadata = parseSmartMetadata(entry.metadata, entry);
+
+      // Skip inactive (superseded) records when requested
+      if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
+        continue;
+      }
+
       const score = scoreLexicalHit(trimmedQuery, [
         { text: entry.text, weight: 1 },
         { text: metadata.l0_abstract, weight: 0.98 },

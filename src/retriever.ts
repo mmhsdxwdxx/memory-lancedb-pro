@@ -354,15 +354,15 @@ export class MemoryRetriever {
       limit,
       this.config.minScore,
       scopeFilter,
+      { excludeInactive: true },
     );
 
     // Filter by category if specified
     const filtered = category
       ? results.filter((r) => r.entry.category === category)
       : results;
-    const active = this.filterActiveResults(filtered);
 
-    const mapped = active.map(
+    const mapped = filtered.map(
       (result, index) =>
         ({
           ...result,
@@ -470,15 +470,15 @@ export class MemoryRetriever {
       limit,
       0.1,
       scopeFilter,
+      { excludeInactive: true },
     );
 
     // Filter by category if specified
     const filtered = category
       ? results.filter((r) => r.entry.category === category)
       : results;
-    const active = this.filterActiveResults(filtered);
 
-    return active.map((result, index) => ({
+    return filtered.map((result, index) => ({
       ...result,
       rank: index + 1,
     }));
@@ -490,15 +490,14 @@ export class MemoryRetriever {
     scopeFilter?: string[],
     category?: string,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.bm25Search(query, limit, scopeFilter);
+    const results = await this.store.bm25Search(query, limit, scopeFilter, { excludeInactive: true });
 
     // Filter by category if specified
     const filtered = category
       ? results.filter((r) => r.entry.category === category)
       : results;
-    const active = this.filterActiveResults(filtered);
 
-    return active.map((result, index) => ({
+    return filtered.map((result, index) => ({
       ...result,
       rank: index + 1,
     }));

@@ -221,6 +221,60 @@ async function runTest() {
     assert.equal(results[0].entry.id, currentEntry.id);
     console.log("  ✅ retrieval prefers current truth by filtering invalidated memories");
 
+    console.log("\nTest 4: retrieval survives crowding by many superseded versions...");
+    // Insert 8 inactive historical versions sharing the same vector space.
+    // With limit=5, a naive top-N + post-filter would return [] because
+    // all 5 raw neighbours are inactive. The store must over-fetch and
+    // filter at query time so the single active fact is always returned.
+    const activeVector = await embedder.embedPassage("饮品偏好：咖啡");
+    for (let i = 0; i < 8; i++) {
+      await store.store({
+        text: `饮品偏好：历史版本${i}`,
+        vector: activeVector, // same vector — crowds the active fact
+        category: "preference",
+        scope: "test",
+        importance: 0.8,
+        metadata: stringifySmartMetadata(
+          buildSmartMetadata(
+            { text: `饮品偏好：历史版本${i}`, category: "preference", importance: 0.8 },
+            {
+              l0_abstract: `饮品偏好：历史版本${i}`,
+              l1_overview: `## Preference\n- 历史版本${i}`,
+              l2_content: `历史版本${i}`,
+              memory_category: "preferences",
+              tier: "working",
+              confidence: 0.8,
+              fact_key: currentMeta.fact_key,
+              valid_from: Date.now() - (10 - i) * 86400000,
+              invalidated_at: Date.now() - (9 - i) * 86400000,
+              superseded_by: currentEntry.id,
+            },
+          ),
+        ),
+      });
+    }
+
+    // Verify there are now 10 total entries (1 original + 1 current + 8 history)
+    const allEntries = await store.list(["test"], undefined, 20, 0);
+    assert.equal(allEntries.length, 10, "should have 10 entries total");
+
+    const crowdedResults = await retriever.retrieve({
+      query: "饮品偏好",
+      limit: 5,
+      scopeFilter: ["test"],
+      source: "cli",
+    });
+
+    assert.ok(crowdedResults.length >= 1, "retrieval must not return empty when active fact exists");
+    assert.equal(crowdedResults[0].entry.id, currentEntry.id,
+      "active fact must be returned even when crowded by 8+ inactive versions");
+    // Ensure no inactive entries leaked through
+    for (const r of crowdedResults) {
+      const meta = parseSmartMetadata(r.entry.metadata, r.entry);
+      assert.equal(isMemoryActiveAt(meta), true, `entry ${r.entry.id} should be active`);
+    }
+    console.log("  ✅ active fact survives crowding by 8 inactive versions (limit=5)");
+
     console.log("\n=== Temporal facts tests passed! ===");
   } finally {
     await new Promise((resolve) => embeddingServer.close(resolve));
