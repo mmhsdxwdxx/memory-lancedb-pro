@@ -1,4 +1,8 @@
-import type { MemoryCategory, MemoryTier } from "./memory-categories.js";
+import {
+  TEMPORAL_VERSIONED_CATEGORIES,
+  type MemoryCategory,
+  type MemoryTier,
+} from "./memory-categories.js";
 import type { DecayableMemory } from "./decay-engine.js";
 
 type LegacyStoreCategory =
@@ -17,6 +21,20 @@ type EntryLike = {
   metadata?: string;
 };
 
+export interface MemoryRelation {
+  type: string;
+  targetId: string;
+}
+
+export type MemoryState = "pending" | "confirmed" | "archived";
+export type MemoryLayer = "durable" | "working" | "reflection" | "archive";
+export type MemorySource =
+  | "manual"
+  | "auto-capture"
+  | "reflection"
+  | "session-summary"
+  | "legacy";
+
 export interface SmartMemoryMetadata {
   l0_abstract: string;
   l1_overview: string;
@@ -26,7 +44,24 @@ export interface SmartMemoryMetadata {
   access_count: number;
   confidence: number;
   last_accessed_at: number;
+  valid_from: number;
+  invalidated_at?: number;
+  memory_temporal_type?: "static" | "dynamic";
+  valid_until?: number;
+  fact_key?: string;
+  supersedes?: string;
+  superseded_by?: string;
+  relations?: MemoryRelation[];
   source_session?: string;
+  state: MemoryState;
+  source: MemorySource;
+  memory_layer: MemoryLayer;
+  injected_count: number;
+  last_injected_at?: number;
+  last_confirmed_use_at?: number;
+  bad_recall_count: number;
+  suppressed_until_turn: number;
+  canonical_id?: string;
   [key: string]: unknown;
 }
 
@@ -135,8 +170,46 @@ export function parseSmartMetadata(
     access_count: clampCount(parsed.access_count, 0),
     confidence: clamp01(parsed.confidence, 0.7),
     last_accessed_at: clampCount(parsed.last_accessed_at, timestamp),
+    valid_from:
+      typeof parsed.valid_from === "number" && Number.isFinite(parsed.valid_from)
+        ? parsed.valid_from
+        : timestamp,
+    invalidated_at:
+      typeof parsed.invalidated_at === "number" && Number.isFinite(parsed.invalidated_at)
+        ? parsed.invalidated_at
+        : undefined,
+    valid_until:
+      typeof parsed.valid_until === "number" && Number.isFinite(parsed.valid_until)
+        ? parsed.valid_until
+        : undefined,
+    fact_key: typeof parsed.fact_key === "string" ? parsed.fact_key : undefined,
+    supersedes: typeof parsed.supersedes === "string" ? parsed.supersedes : undefined,
+    superseded_by: typeof parsed.superseded_by === "string" ? parsed.superseded_by : undefined,
+    relations: Array.isArray(parsed.relations) ? parsed.relations as MemoryRelation[] : undefined,
     source_session:
       typeof parsed.source_session === "string" ? parsed.source_session : undefined,
+    state:
+      typeof parsed.state === "string" && ["pending", "confirmed", "archived"].includes(parsed.state)
+        ? (parsed.state as MemoryState)
+        : "confirmed" as MemoryState,
+    source:
+      typeof parsed.source === "string" ? (parsed.source as MemorySource) : "manual" as MemorySource,
+    memory_layer:
+      typeof parsed.memory_layer === "string" && ["durable", "working", "reflection", "archive"].includes(parsed.memory_layer)
+        ? (parsed.memory_layer as MemoryLayer)
+        : "working" as MemoryLayer,
+    injected_count: clampCount(parsed.injected_count, 0),
+    last_injected_at:
+      typeof parsed.last_injected_at === "number" && Number.isFinite(parsed.last_injected_at)
+        ? parsed.last_injected_at
+        : undefined,
+    last_confirmed_use_at:
+      typeof parsed.last_confirmed_use_at === "number" && Number.isFinite(parsed.last_confirmed_use_at)
+        ? parsed.last_confirmed_use_at
+        : undefined,
+    bad_recall_count: clampCount(parsed.bad_recall_count, 0),
+    suppressed_until_turn: clampCount(parsed.suppressed_until_turn, 0),
+    canonical_id: typeof parsed.canonical_id === "string" ? parsed.canonical_id : undefined,
   };
 
   return normalized;
@@ -246,6 +319,92 @@ export function getDecayableFromEntry(
   };
 
   return { memory, meta };
+}
+
+// ============================================================================
+// Temporal Awareness — fact versioning and supersede support
+// ============================================================================
+
+/**
+ * Derive a stable fact key from category + abstract for temporal versioning.
+ * Returns undefined for non-temporal categories.
+ */
+export function deriveFactKey(
+  category: MemoryCategory,
+  abstract: string,
+): string | undefined {
+  if (!TEMPORAL_VERSIONED_CATEGORIES.has(category)) return undefined;
+
+  const trimmed = abstract.trim();
+  if (!trimmed) return undefined;
+
+  let topic = trimmed;
+  const colonMatch = trimmed.match(/^(.{1,120}?)[：:]/);
+  const arrowMatch = trimmed.match(/^(.{1,120}?)(?:\s*->|\s*=>)/);
+  if (colonMatch?.[1]) {
+    topic = colonMatch[1];
+  } else if (arrowMatch?.[1]) {
+    topic = arrowMatch[1];
+  }
+
+  const normalized = topic
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[。.!?]+$/g, "")
+    .trim();
+
+  return normalized ? `${category}:${normalized}` : undefined;
+}
+
+/**
+ * Check if a memory is active at a given point in time.
+ * Returns false if valid_from is in the future, or invalidated_at is in the past.
+ */
+export function isMemoryActiveAt(
+  metadata: Pick<SmartMemoryMetadata, "valid_from" | "invalidated_at">,
+  at = Date.now(),
+): boolean {
+  if ((metadata.valid_from ?? 0) > at) return false;
+  return !metadata.invalidated_at || metadata.invalidated_at > at;
+}
+
+/**
+ * Check if a memory has passed its expiry date (valid_until).
+ * Returns false if valid_until is not set (no expiry = permanent).
+ */
+export function isMemoryExpired(
+  metadata: Pick<SmartMemoryMetadata, "valid_until">,
+  at: number = Date.now(),
+): boolean {
+  return metadata.valid_until != null && metadata.valid_until <= at;
+}
+
+// ============================================================================
+// Relation Management
+// ============================================================================
+
+/**
+ * Append a relation to an existing relations array, deduplicating by type+targetId.
+ */
+export function appendRelation(
+  existing: unknown,
+  relation: MemoryRelation,
+): MemoryRelation[] {
+  const rows = Array.isArray(existing)
+    ? existing.filter(
+      (item): item is MemoryRelation =>
+        !!item &&
+        typeof item === "object" &&
+        typeof (item as { type?: unknown }).type === "string" &&
+        typeof (item as { targetId?: unknown }).targetId === "string",
+    )
+    : [];
+
+  if (rows.some((item) => item.type === relation.type && item.targetId === relation.targetId)) {
+    return rows;
+  }
+
+  return [...rows, relation];
 }
 
 // ============================================================================

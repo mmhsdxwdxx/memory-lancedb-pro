@@ -26,6 +26,12 @@ export const MERGE_SUPPORTED_CATEGORIES = new Set<MemoryCategory>([
   "patterns",
 ]);
 
+/** Categories where mutable facts can be superseded over time. */
+export const TEMPORAL_VERSIONED_CATEGORIES = new Set<MemoryCategory>([
+  "preferences",
+  "entities",
+]);
+
 /** Categories that are append-only (CREATE or SKIP only, no MERGE). */
 export const APPEND_ONLY_CATEGORIES = new Set<MemoryCategory>([
   "events",
@@ -44,7 +50,7 @@ export type CandidateMemory = {
 };
 
 /** Dedup decision from LLM. */
-export type DedupDecision = "create" | "merge" | "skip" | "support" | "contextualize" | "contradict";
+export type DedupDecision = "create" | "merge" | "supersede" | "skip" | "support" | "contextualize" | "contradict";
 
 export type DedupResult = {
   decision: DedupDecision;
@@ -56,6 +62,7 @@ export type DedupResult = {
 export type ExtractionStats = {
   created: number;
   merged: number;
+  superseded?: number;
   skipped: number;
   supported?: number; // context-aware support count
 };

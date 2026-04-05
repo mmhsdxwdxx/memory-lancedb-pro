@@ -12,8 +12,8 @@ import {
   realpathSync,
   lstatSync,
 } from "node:fs";
-import { dirname } from "node:path";
-import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { dirname, join } from "node:path";
+import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 import { resolvePositiveIntEnv, runWithTimeout } from "./runtime-resilience.js";
 
 // ============================================================================
@@ -52,11 +52,25 @@ export interface MetadataPatch {
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null =
   null;
 
+// =========================================================================
+// Cross-Process File Lock (proper-lockfile)
+// =========================================================================
+
+let lockfileModule: any = null;
+
+async function loadLockfile(): Promise<any> {
+  if (!lockfileModule) {
+    lockfileModule = await import("proper-lockfile");
+  }
+  return lockfileModule;
+}
+
 export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
-    lancedbImportPromise = import("@lancedb/lancedb");
+    // Use require() for CommonJS modules on Windows to avoid ESM URL scheme issues
+    lancedbImportPromise = Promise.resolve(require("@lancedb/lancedb"));
   }
   try {
     return await lancedbImportPromise;
@@ -83,6 +97,10 @@ function escapeSqlLiteral(value: string): string {
 
 function normalizeSearchText(value: string): string {
   return value.toLowerCase().trim();
+}
+
+function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
+  return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
 
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
@@ -195,6 +213,20 @@ export class MemoryStore {
 
   constructor(private readonly config: StoreConfig) { }
 
+  private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    const lockfile = await loadLockfile();
+    const lockPath = join(this.config.dbPath, ".memory-write.lock");
+    if (!existsSync(lockPath)) {
+      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
+      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
+    }
+    const release = await lockfile.lock(lockPath, {
+      retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
+      stale: 10000,
+    });
+    try { return await fn(); } finally { await release(); }
+  }
+
   get dbPath(): string {
     return this.config.dbPath;
   }
@@ -207,11 +239,7 @@ export class MemoryStore {
       return this.initPromise;
     }
 
-    this.initPromise = runWithTimeout(
-      () => this.doInitialize(),
-      DEFAULT_LANCEDB_INIT_TIMEOUT_MS,
-      `LanceDB init (${this.config.dbPath})`,
-    ).catch((err) => {
+    this.initPromise = this.doInitialize().catch((err) => {
       this.initPromise = null;
       throw err;
     });
@@ -241,16 +269,39 @@ export class MemoryStore {
     try {
       table = await db.openTable(TABLE_NAME);
 
-      // Check if we need to add scope column for backward compatibility
+      // Migrate legacy tables: add missing columns for backward compatibility
       try {
-        const sample = await table.query().limit(1).toArray();
-        if (sample.length > 0 && !("scope" in sample[0])) {
+        const schema = await table.schema();
+        const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
+
+        const missingColumns: Array<{ name: string; valueSql: string }> = [];
+        if (!fieldNames.has("scope")) {
+          missingColumns.push({ name: "scope", valueSql: "'global'" });
+        }
+        if (!fieldNames.has("timestamp")) {
+          missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
+        }
+        if (!fieldNames.has("metadata")) {
+          missingColumns.push({ name: "metadata", valueSql: "'{}'" });
+        }
+
+        if (missingColumns.length > 0) {
           console.warn(
-            "Adding scope column for backward compatibility with existing data",
+            `memory-lancedb-pro: migrating legacy table — adding columns: ${missingColumns.map((c) => c.name).join(", ")}`,
+          );
+          await table.addColumns(missingColumns);
+          console.log(
+            `memory-lancedb-pro: migration complete — ${missingColumns.length} column(s) added`,
           );
         }
       } catch (err) {
-        console.warn("Could not check table schema:", err);
+        const msg = String(err);
+        if (msg.includes("already exists")) {
+          // Concurrent initialization race — another process already added the columns
+          console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
+        } else {
+          console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
+        }
       }
     } catch (_openErr) {
       // Table doesn't exist yet — create it
@@ -322,7 +373,7 @@ export class MemoryStore {
         // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
         const lancedb = await loadLanceDB();
         await table.createIndex("text", {
-          config: (lancedb as any).Index.fts(),
+          config: (lancedb as any).Index.fts({ withPosition: true }),
         });
       }
     } catch (err) {
@@ -344,20 +395,18 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     };
 
-    try {
-      await runWithTimeout(
-        () => this.table!.add([fullEntry]),
-        DEFAULT_LANCEDB_OP_TIMEOUT_MS,
-        `LanceDB store (${this.config.dbPath})`,
-      );
-    } catch (err: any) {
-      const code = err.code || "";
-      const message = err.message || String(err);
-      throw new Error(
-        `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
-      );
-    }
-    return fullEntry;
+    return this.runWithFileLock(async () => {
+      try {
+        await this.table!.add([fullEntry]);
+      } catch (err: any) {
+        const code = err.code || "";
+        const message = err.message || String(err);
+        throw new Error(
+          `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
+        );
+      }
+      return fullEntry;
+    });
   }
 
   /**
@@ -389,40 +438,34 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     };
 
-    await this.table!.add([full]);
-    return full;
+    return this.runWithFileLock(async () => {
+      await this.table!.add([full]);
+      return full;
+    });
   }
 
   async hasId(id: string): Promise<boolean> {
     await this.ensureInitialized();
     const safeId = escapeSqlLiteral(id);
-    const res = await runWithTimeout(
-      () =>
-        this.table!.query()
-          .select(["id"])
-          .where(`id = '${safeId}'`)
-          .limit(1)
-          .toArray(),
-      DEFAULT_LANCEDB_OP_TIMEOUT_MS,
-      `LanceDB hasId (${this.config.dbPath})`,
-    );
+    const res = await this.table!.query()
+      .select(["id"])
+      .where(`id = '${safeId}'`)
+      .limit(1)
+      .toArray();
     return res.length > 0;
   }
 
   async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return null;
+
     const safeId = escapeSqlLiteral(id);
-    const rows = await runWithTimeout(
-      () =>
-        this.table!
-          .query()
-          .where(`id = '${safeId}'`)
-          .limit(1)
-          .toArray(),
-      DEFAULT_LANCEDB_OP_TIMEOUT_MS,
-      `LanceDB getById (${this.config.dbPath})`,
-    );
+    const rows = await this.table!
+      .query()
+      .where(`id = '${safeId}'`)
+      .limit(1)
+      .toArray();
 
     if (rows.length === 0) return null;
 
@@ -444,11 +487,17 @@ export class MemoryStore {
     };
   }
 
-  async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[]): Promise<MemorySearchResult[]> {
+  async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+
     const safeLimit = clampInt(limit, 1, 20);
-    const fetchLimit = Math.min(safeLimit * 10, 200); // Over-fetch for scope filtering
+    // Over-fetch more aggressively when filtering inactive records,
+    // because superseded historical rows can crowd out active ones.
+    const inactiveFilter = options?.excludeInactive ?? false;
+    const overFetchMultiplier = inactiveFilter ? 20 : 10;
+    const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
     let query = this.table!.vectorSearch(vector).distanceType('cosine').limit(fetchLimit);
 
@@ -460,11 +509,7 @@ export class MemoryStore {
       query = query.where(`(${scopeConditions}) OR scope IS NULL`); // NULL for backward compatibility
     }
 
-    const results = await runWithTimeout(
-      () => query.toArray(),
-      DEFAULT_LANCEDB_OP_TIMEOUT_MS,
-      `LanceDB vectorSearch (${this.config.dbPath})`,
-    );
+    const results = await query.toArray();
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {
@@ -484,19 +529,23 @@ export class MemoryStore {
         continue;
       }
 
-      mapped.push({
-        entry: {
-          id: row.id as string,
-          text: row.text as string,
-          vector: row.vector as number[],
-          category: row.category as MemoryEntry["category"],
-          scope: rowScope,
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
-          metadata: (row.metadata as string) || "{}",
-        },
-        score,
-      });
+      const entry: MemoryEntry = {
+        id: row.id as string,
+        text: row.text as string,
+        vector: row.vector as number[],
+        category: row.category as MemoryEntry["category"],
+        scope: rowScope,
+        importance: Number(row.importance),
+        timestamp: Number(row.timestamp),
+        metadata: (row.metadata as string) || "{}",
+      };
+
+      // Skip inactive (superseded) records when requested
+      if (inactiveFilter && !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))) {
+        continue;
+      }
+
+      mapped.push({ entry, score });
 
       if (mapped.length >= safeLimit) break;
     }
@@ -508,18 +557,24 @@ export class MemoryStore {
     query: string,
     limit = 5,
     scopeFilter?: string[],
+    options?: { excludeInactive?: boolean },
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+
     const safeLimit = clampInt(limit, 1, 20);
+    const inactiveFilter = options?.excludeInactive ?? false;
+    // Over-fetch when filtering inactive records to avoid crowding
+    const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
 
     if (!this.ftsIndexCreated) {
-      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     }
 
     try {
       // Use FTS query type explicitly
-      let searchQuery = this.table!.search(query, "fts").limit(safeLimit);
+      let searchQuery = this.table!.search(query, "fts").limit(fetchLimit);
 
       // Apply scope filter if provided
       if (scopeFilter && scopeFilter.length > 0) {
@@ -552,8 +607,7 @@ export class MemoryStore {
         const normalizedScore =
           rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
 
-        mapped.push({
-          entry: {
+        const entry: MemoryEntry = {
             id: row.id as string,
             text: row.text as string,
             vector: row.vector as number[],
@@ -562,22 +616,29 @@ export class MemoryStore {
             importance: Number(row.importance),
             timestamp: Number(row.timestamp),
             metadata: (row.metadata as string) || "{}",
-          },
-          score: normalizedScore,
-        });
+        };
+
+        // Skip inactive (superseded) records when requested
+        if (inactiveFilter && !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))) {
+          continue;
+        }
+
+        mapped.push({ entry, score: normalizedScore });
       }
 
       if (mapped.length > 0) {
         return mapped;
       }
-      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     } catch (err) {
       console.warn("BM25 search failed, falling back to empty results:", err);
-      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     }
   }
 
-  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[]): Promise<MemorySearchResult[]> {
+  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+
     const trimmedQuery = query.trim();
     if (!trimmedQuery) return [];
 
@@ -620,6 +681,12 @@ export class MemoryStore {
       };
 
       const metadata = parseSmartMetadata(entry.metadata, entry);
+
+      // Skip inactive (superseded) records when requested
+      if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
+        continue;
+      }
+
       const score = scoreLexicalHit(trimmedQuery, [
         { text: entry.text, weight: 1 },
         { text: metadata.l0_abstract, weight: 0.98 },
@@ -638,6 +705,10 @@ export class MemoryStore {
 
   async delete(id: string, scopeFilter?: string[]): Promise<boolean> {
     await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
 
     // Support both full UUID and short prefix (8+ hex chars)
     const uuidRegex =
@@ -685,8 +756,10 @@ export class MemoryStore {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
 
-    await this.table!.delete(`id = '${resolvedId}'`);
-    return true;
+    return this.runWithFileLock(async () => {
+      await this.table!.delete(`id = '${resolvedId}'`);
+      return true;
+    });
   }
 
   async list(
@@ -696,6 +769,8 @@ export class MemoryStore {
     offset = 0,
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     let query = this.table!.query();
 
@@ -754,6 +829,14 @@ export class MemoryStore {
   }> {
     await this.ensureInitialized();
 
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      return {
+        totalCount: 0,
+        scopeCounts: {},
+        categoryCounts: {},
+      };
+    }
+
     let query = this.table!.query();
 
     if (scopeFilter && scopeFilter.length > 0) {
@@ -796,7 +879,11 @@ export class MemoryStore {
   ): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 
-    return this.runSerializedUpdate(async () => {
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
+
+    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -911,7 +998,7 @@ export class MemoryStore {
       }
 
       return updated;
-    });
+    }));
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
@@ -970,16 +1057,18 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    // Count first
-    const countResults = await this.table!.query().where(whereClause).toArray();
-    const deleteCount = countResults.length;
+    return this.runWithFileLock(async () => {
+      // Count first
+      const countResults = await this.table!.query().where(whereClause).toArray();
+      const deleteCount = countResults.length;
 
-    // Then delete
-    if (deleteCount > 0) {
-      await this.table!.delete(whereClause);
-    }
+      // Then delete
+      if (deleteCount > 0) {
+        await this.table!.delete(whereClause);
+      }
 
-    return deleteCount;
+      return deleteCount;
+    });
   }
 
   get hasFtsSupport(): boolean {
@@ -1027,5 +1116,50 @@ export class MemoryStore {
       this.ftsIndexCreated = false;
       return { success: false, error: msg };
     }
+  }
+
+  /**
+   * Fetch memories older than `maxTimestamp` including their raw vectors.
+   * Used exclusively by the memory compactor; vectors are intentionally
+   * omitted from `list()` for performance, but compaction needs them for
+   * cosine-similarity clustering.
+   */
+  async fetchForCompaction(
+    maxTimestamp: number,
+    scopeFilter?: string[],
+    limit = 200,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    const conditions: string[] = [`timestamp < ${maxTimestamp}`];
+
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+    }
+
+    const whereClause = conditions.join(" AND ");
+
+    const results = await this.table!
+      .query()
+      .where(whereClause)
+      .toArray();
+
+    return results
+      .slice(0, limit)
+      .map(
+        (row): MemoryEntry => ({
+          id: row.id as string,
+          text: row.text as string,
+          vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
+          category: row.category as MemoryEntry["category"],
+          scope: (row.scope as string | undefined) ?? "global",
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
+          metadata: (row.metadata as string) || "{}",
+        }),
+      );
   }
 }
