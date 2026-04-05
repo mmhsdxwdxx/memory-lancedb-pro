@@ -154,9 +154,10 @@ Please decide:
 - CONTRADICT: Candidate directly contradicts an existing memory in a specific context (e.g. existing: "runs on weekends", candidate: "stopped running on weekends")
 
 IMPORTANT:
-- "events" and "cases" categories are independent records — they generally only support SKIP or CREATE.
-  Exception: if an event DIRECTLY INVALIDATES a fact stated in an existing entity memory (e.g., candidate event says "changed X to Y" and existing entity says "X is Z"), use CONTRADICT with that entity's match_index. If the event invalidates MULTIPLE entity memories, pick the most significantly affected one. This is the ONLY exception for events — all other cross-type combinations still require SKIP or CREATE.
-  "cases" have NO exceptions — always SKIP or CREATE.
+- MERGE vs CONTRADICT: MERGE means existing info STAYS TRUE and new details are ADDED alongside it (e.g., existing: "likes tea" → candidate: "also likes coffee" = MERGE, because liking tea is still true). CONTRADICT means existing info is NO LONGER TRUE because it was replaced, switched, stopped, or changed (e.g., existing: "main editor is VS Code" → candidate: "switched to Cursor" = CONTRADICT, because "main editor is VS Code" is now false). "Switched from X to Y" or "replaced X with Y" is ALWAYS CONTRADICT, not MERGE.
+- "cases" category: ALWAYS SKIP or CREATE, with ZERO exceptions — even when two cases describe conflicting solutions to the same problem, use CREATE (they are independent records).
+- "events" category: generally only SKIP or CREATE.
+  SOLE exception: if an event DIRECTLY INVALIDATES a fact in an existing entity/preference memory (e.g., "changed X to Y" vs existing "X is Z"), use CONTRADICT with that entity's match_index. When multiple existing memories are affected, you MUST still pick one — choose the most significantly affected match_index. Do NOT fall back to CREATE just because multiple memories are involved.
 - If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
 - A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
 - For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
