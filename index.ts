@@ -20,8 +20,10 @@ import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import { performManualMemoryStoreWrite } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
+import { ManualMemoryStoreQueue } from "./src/manual-store-queue.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
@@ -33,9 +35,11 @@ import {
 import {
   extractReflectionLearningGovernanceCandidates,
   extractReflectionMappedMemoryItems,
+  extractReflectionSlices,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { isReflectionRecallExcludedEntry } from "./src/reflection-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 
@@ -52,6 +56,7 @@ import {
   stringifySmartMetadata,
   toLifecycleMemory,
 } from "./src/smart-metadata.js";
+import { resolvePositiveIntEnv } from "./src/runtime-resilience.js";
 
 // ============================================================================
 // Configuration & Types
@@ -181,6 +186,55 @@ function resolveWorkspaceDirFromContext(context: Record<string, unknown> | undef
   return runtimePath || getDefaultWorkspaceDir();
 }
 
+function snapshotReflectionSessionEntry(entry: unknown): Record<string, unknown> | undefined {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+  const src = entry as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of ["sessionId", "sessionFile", "agentId", "sessionsDir", "sessionDir"]) {
+    const value = src[key];
+    if (typeof value === "string" && value.trim().length > 0) out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function snapshotReflectionHookEvent(event: any): Record<string, unknown> {
+  const context = event?.context && typeof event.context === "object" && !Array.isArray(event.context)
+    ? event.context as Record<string, unknown>
+    : {};
+
+  const contextSnapshot: Record<string, unknown> = {};
+  if (typeof context.cfg !== "undefined") contextSnapshot.cfg = context.cfg;
+  if (typeof context.workspaceDir === "string" && context.workspaceDir.trim().length > 0) {
+    contextSnapshot.workspaceDir = context.workspaceDir;
+  }
+  if (typeof context.agentId === "string" && context.agentId.trim().length > 0) {
+    contextSnapshot.agentId = context.agentId;
+  }
+  if (typeof context.sessionKey === "string" && context.sessionKey.trim().length > 0) {
+    contextSnapshot.sessionKey = context.sessionKey;
+  }
+  if (typeof context.commandSource === "string" && context.commandSource.trim().length > 0) {
+    contextSnapshot.commandSource = context.commandSource;
+  }
+  const previousSessionEntry = snapshotReflectionSessionEntry(context.previousSessionEntry);
+  if (previousSessionEntry) contextSnapshot.previousSessionEntry = previousSessionEntry;
+  const sessionEntry = snapshotReflectionSessionEntry(context.sessionEntry);
+  if (sessionEntry) contextSnapshot.sessionEntry = sessionEntry;
+
+  const eventSnapshot: Record<string, unknown> = {
+    action: typeof event?.action === "string" && event.action.trim().length > 0 ? event.action : "unknown",
+    timestamp: typeof event?.timestamp === "number" ? event.timestamp : Date.now(),
+    context: contextSnapshot,
+  };
+  if (typeof event?.sessionKey === "string" && event.sessionKey.trim().length > 0) {
+    eventSnapshot.sessionKey = event.sessionKey;
+  }
+  if (typeof event?.agentId === "string" && event.agentId.trim().length > 0) {
+    eventSnapshot.agentId = event.agentId;
+  }
+  return eventSnapshot;
+}
+
 function resolveEnvVars(value: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
     const envValue = process.env[envVar];
@@ -284,6 +338,17 @@ const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
+const AUTO_RECALL_TIMEOUT_MS = resolvePositiveIntEnv(
+  "MEMORY_LANCEDB_PRO_AUTO_RECALL_TIMEOUT_MS",
+  4_500,
+  { min: 1_000, max: 60_000 },
+);
+const MANUAL_STORE_WORKER_TIMEOUT_MS = resolvePositiveIntEnv(
+  "MEMORY_LANCEDB_PRO_MANUAL_STORE_WORKER_TIMEOUT_MS",
+  45_000,
+  { min: 5_000, max: 180_000 },
+);
+const REFLECTION_DEDUP_REGISTRY_GLOBAL_KEY = "__memoryLancedbProReflectionDedupRegistry__";
 
 type ReflectionErrorSignal = {
   at: number;
@@ -301,10 +366,156 @@ type ReflectionErrorState = {
   updatedAt: number;
 };
 
+type ReflectionDedupStatus = "running" | "completed";
+
+type ReflectionDedupEntry = {
+  updatedAt: number;
+  status: ReflectionDedupStatus;
+};
+
+type ReflectionDedupGlobal = typeof globalThis & {
+  __memoryLancedbProReflectionDedupRegistry__?: Map<string, ReflectionDedupEntry>;
+};
+
 type EmbeddedPiRunner = (params: Record<string, unknown>) => Promise<unknown>;
 
 const requireFromHere = createRequire(import.meta.url);
 let embeddedPiRunnerPromise: Promise<EmbeddedPiRunner> | null = null;
+
+function getReflectionDedupRegistry(): Map<string, ReflectionDedupEntry> {
+  const root = globalThis as ReflectionDedupGlobal;
+  if (!(root[REFLECTION_DEDUP_REGISTRY_GLOBAL_KEY] instanceof Map)) {
+    root[REFLECTION_DEDUP_REGISTRY_GLOBAL_KEY] = new Map<string, ReflectionDedupEntry>();
+  }
+  return root[REFLECTION_DEDUP_REGISTRY_GLOBAL_KEY]!;
+}
+
+export function pruneReflectionDedupRegistry(
+  now = Date.now(),
+  ttlMs = DEFAULT_REFLECTION_SESSION_TTL_MS,
+): void {
+  const registry = getReflectionDedupRegistry();
+  for (const [key, entry] of registry.entries()) {
+    if (now - entry.updatedAt > ttlMs) {
+      registry.delete(key);
+    }
+  }
+
+  if (registry.size <= DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS) return;
+  const sorted = [...registry.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+  const removeCount = registry.size - DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS;
+  for (let i = 0; i < removeCount; i++) {
+    const key = sorted[i]?.[0];
+    if (key) registry.delete(key);
+  }
+}
+
+export function buildReflectionDedupKey(params: {
+  scope: "command" | "before_agent_start";
+  action?: string;
+  agentId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  sessionFile?: string;
+}): string {
+  const scope = params.scope.trim();
+  if (!scope) return "";
+
+  const parts = [scope];
+  const action = typeof params.action === "string" ? params.action.trim() : "";
+  if (action) parts.push(action);
+
+  const agentId = typeof params.agentId === "string" ? params.agentId.trim() : "";
+  if (agentId) parts.push(`agent:${agentId}`);
+
+  const sessionId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
+  if (sessionId && sessionId !== "unknown") {
+    parts.push(`session-id:${sessionId}`);
+    return parts.join("::");
+  }
+
+  const sessionFile = typeof params.sessionFile === "string" ? params.sessionFile.trim() : "";
+  if (sessionFile) {
+    parts.push(`session-file:${sessionFile}`);
+    return parts.join("::");
+  }
+
+  const sessionKey = typeof params.sessionKey === "string" ? params.sessionKey.trim() : "";
+  if (params.scope === "command") {
+    return "";
+  }
+  if (sessionKey) {
+    parts.push(`session-key:${sessionKey}`);
+    return parts.join("::");
+  }
+
+  return "";
+}
+
+export function acquireReflectionDedup(
+  key: string,
+  now = Date.now(),
+): { acquired: boolean; reason?: ReflectionDedupStatus } {
+  const normalized = key.trim();
+  if (!normalized) return { acquired: true };
+
+  pruneReflectionDedupRegistry(now);
+  const registry = getReflectionDedupRegistry();
+  const existing = registry.get(normalized);
+  if (existing) {
+    existing.updatedAt = now;
+    return { acquired: false, reason: existing.status };
+  }
+
+  registry.set(normalized, {
+    updatedAt: now,
+    status: "running",
+  });
+  return { acquired: true };
+}
+
+export function settleReflectionDedup(
+  key: string,
+  outcome: "completed" | "failed",
+  now = Date.now(),
+): void {
+  const normalized = key.trim();
+  if (!normalized) return;
+
+  const registry = getReflectionDedupRegistry();
+  if (outcome === "failed") {
+    registry.delete(normalized);
+    return;
+  }
+
+  registry.set(normalized, {
+    updatedAt: now,
+    status: "completed",
+  });
+}
+
+export function resetReflectionDedupRegistryForTests(): void {
+  getReflectionDedupRegistry().clear();
+}
+
+export function isMeaningfulReflectionOutput(reflectionText: string): boolean {
+  if (typeof reflectionText !== "string" || !reflectionText.trim()) return false;
+
+  const slices = extractReflectionSlices(reflectionText);
+  if (slices.invariants.length > 0 || slices.derived.length > 0) return true;
+  if (extractReflectionMappedMemoryItems(reflectionText).length > 0) return true;
+  if (extractReflectionLearningGovernanceCandidates(reflectionText).length > 0) return true;
+  return false;
+}
+
+export function shouldUseCliReflectionFallback(embeddedError?: string): boolean {
+  const normalized = typeof embeddedError === "string" ? embeddedError.trim().toLowerCase() : "";
+  if (!normalized) return false;
+  return normalized.includes("unable to load openclaw embedded runtime api") ||
+    normalized.includes("runembeddedpiagent export not found") ||
+    normalized.includes("openclaw_extension_api_path") ||
+    normalized.includes("openclaw/dist/extensionapi.js");
+}
 
 function toImportSpecifier(value: string): string {
   const trimmed = value.trim();
@@ -659,7 +870,7 @@ const AUTO_CAPTURE_INBOUND_META_SENTINELS = [
 ] as const;
 
 const AUTO_CAPTURE_SESSION_RESET_PREFIX =
-  "A new session was started via /new or /reset. Execute your Session Startup sequence now";
+  "A new session was started via /new or /reset. Execute your Session Startup sequence now, then send one visible greeting to the user. Do NOT reply with NO_REPLY, SILENT_REPLY, an empty reply, or only hidden reasoning.";
 const AUTO_CAPTURE_ADDRESSING_PREFIX_RE = /^(?:<@!?[0-9]+>|@[A-Za-z0-9_.-]+)\s*/;
 const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
 const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
@@ -1199,6 +1410,17 @@ async function generateReflectionText(params: {
     return { text: reflectionText, usedFallback: false, promptHash, error: errors[0], runner: "embedded" };
   }
 
+  const embeddedError = errors[0];
+  if (!shouldUseCliReflectionFallback(embeddedError)) {
+    return {
+      text: buildReflectionFallbackText(),
+      usedFallback: true,
+      promptHash,
+      error: errors.length > 0 ? errors.join(" | ") : undefined,
+      runner: "fallback",
+    };
+  }
+
   try {
     reflectionText = await runWithReflectionTransientRetryOnce({
       scope: "reflection",
@@ -1636,6 +1858,37 @@ const memoryLanceDBProPlugin = {
     );
     const scopeManager = createScopeManager(config.scopes);
     const migrator = createMigrator(store);
+    const mdMirror = createMdMirrorWriter(api, config);
+    const manualStoreQueue = new ManualMemoryStoreQueue({
+      queueFile: join(resolvedDbPath, "_manual-store-queue.json"),
+      deadLetterFile: join(resolvedDbPath, "_manual-store-dead-letter.jsonl"),
+      logger: api.logger,
+      process: async (job) => {
+        await withTimeout(
+          performManualMemoryStoreWrite(
+            {
+              retriever,
+              store,
+              scopeManager,
+              embedder,
+              agentId: job.agentId,
+              workspaceDir: getDefaultWorkspaceDir(),
+              mdMirror,
+              logger: api.logger,
+            },
+            {
+              text: job.text,
+              importance: job.importance,
+              category: job.category,
+              scope: job.scope,
+              agentId: job.agentId,
+            },
+          ),
+          MANUAL_STORE_WORKER_TIMEOUT_MS,
+          `queued memory_store job ${job.id}`,
+        );
+      },
+    });
 
     // Initialize smart extraction
     let smartExtractor: SmartExtractor | null = null;
@@ -1923,8 +2176,6 @@ const memoryLanceDBProPlugin = {
     // Markdown Mirror
     // ========================================================================
 
-    const mdMirror = createMdMirrorWriter(api, config);
-
     // ========================================================================
     // Register Tools
     // ========================================================================
@@ -1939,6 +2190,8 @@ const memoryLanceDBProPlugin = {
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
+        manualStoreQueue,
+        logger: api.logger,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -2002,27 +2255,42 @@ const memoryLanceDBProPlugin = {
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
-          const results = await retrieveWithRetry({
-            query: event.prompt,
-            limit: 3,
-            scopeFilter: accessibleScopes,
-            source: "auto-recall",
-          });
+          const results = await withTimeout(
+            retrieveWithRetry({
+              query: event.prompt,
+              limit: 3,
+              scopeFilter: accessibleScopes,
+              source: "auto-recall",
+            }),
+            AUTO_RECALL_TIMEOUT_MS,
+            "autoRecall retrieval",
+          );
 
           if (results.length === 0) {
             return;
           }
 
-          const tierOverrides = await runRecallLifecycle(results, accessibleScopes);
+          const recallableResults = results.filter((r) => !isReflectionRecallExcludedEntry(r.entry));
+          const suppressedReflectionRows = results.length - recallableResults.length;
+          if (suppressedReflectionRows > 0) {
+            api.logger.info?.(
+              `memory-lancedb-pro: suppressed ${suppressedReflectionRows} reflection row(s) from ordinary recall for agent ${agentId}`,
+            );
+          }
+          if (recallableResults.length === 0) {
+            return;
+          }
+
+          const tierOverrides = await runRecallLifecycle(recallableResults, accessibleScopes);
           // Filter out redundant memories based on session history
           const minRepeated = config.autoRecallMinRepeated ?? 0;
 
           // Only enable dedup logic when minRepeated > 0
-          let finalResults = results;
+          let finalResults = recallableResults;
 
           if (minRepeated > 0) {
             const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
-            const filteredResults = results.filter((r) => {
+            const filteredResults = recallableResults.filter((r) => {
               const lastTurn = sessionHistory.get(r.entry.id) ?? -999;
               const diff = currentTurn - lastTurn;
               const isRedundant = diff < minRepeated;
@@ -2036,9 +2304,9 @@ const memoryLanceDBProPlugin = {
             });
 
             if (filteredResults.length === 0) {
-              if (results.length > 0) {
+              if (recallableResults.length > 0) {
                 api.logger.info?.(
-                  `memory-lancedb-pro: all ${results.length} memories were filtered out due to redundancy policy`,
+                  `memory-lancedb-pro: all ${recallableResults.length} memories were filtered out due to redundancy policy`,
                 );
               }
               return;
@@ -2521,9 +2789,17 @@ const memoryLanceDBProPlugin = {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
+        const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
+        const dedupKey = buildReflectionDedupKey({
+          scope: "before_agent_start",
+          agentId,
+          sessionKey,
+        });
+        const dedup = acquireReflectionDedup(dedupKey);
+        if (!dedup.acquired) return;
+        let dedupOutcome: "completed" | "failed" = "completed";
         try {
           pruneReflectionSessionState();
-          const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
           const scopes = scopeManager.getAccessibleScopes(agentId);
           const slices = await loadAgentReflectionSlices(agentId, scopes);
           if (slices.invariants.length === 0) return;
@@ -2537,7 +2813,10 @@ const memoryLanceDBProPlugin = {
             ].join("\n"),
           };
         } catch (err) {
+          dedupOutcome = "failed";
           api.logger.warn(`memory-reflection: inheritance injection failed: ${String(err)}`);
+        } finally {
+          settleReflectionDedup(dedupKey, dedupOutcome);
         }
       }, { priority: 12 });
 
@@ -2599,6 +2878,9 @@ const memoryLanceDBProPlugin = {
 
       const runMemoryReflection = async (event: any) => {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+        let dedupKey = "";
+        let dedupAcquired = false;
+        let dedupOutcome: "completed" | "failed" = "completed";
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
@@ -2615,6 +2897,24 @@ const memoryLanceDBProPlugin = {
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
           const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
+
+          dedupKey = buildReflectionDedupKey({
+            scope: "command",
+            action,
+            agentId: sourceAgentId,
+            sessionId: currentSessionId,
+            sessionKey,
+            sessionFile: currentSessionFile,
+          });
+          const dedup = acquireReflectionDedup(dedupKey);
+          if (!dedup.acquired) {
+            api.logger.info(
+              `memory-reflection: command:${action} dedupe skip; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; reason=${dedup.reason || "duplicate"}`
+            );
+            return;
+          }
+          dedupAcquired = true;
+
           api.logger.info(
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
           );
@@ -2704,6 +3004,16 @@ const memoryLanceDBProPlugin = {
               `memory-reflection: fallback used for session ${currentSessionId}` +
               (reflectionGenerated.error ? ` (${reflectionGenerated.error})` : "")
             );
+          }
+
+          if (!isMeaningfulReflectionOutput(reflectionText)) {
+            if (sessionKey) {
+              reflectionDerivedBySession.delete(sessionKey);
+            }
+            api.logger.info(
+              `memory-reflection: command:${action} no durable reflection signal for session ${currentSessionId}; skip persistence`
+            );
+            return;
           }
 
           const header = [
@@ -2852,8 +3162,12 @@ const memoryLanceDBProPlugin = {
 
           api.logger.info(`memory-reflection: wrote ${relPath} for session ${currentSessionId}`);
         } catch (err) {
+          dedupOutcome = "failed";
           api.logger.warn(`memory-reflection: hook failed: ${String(err)}`);
         } finally {
+          if (dedupAcquired) {
+            settleReflectionDedup(dedupKey, dedupOutcome);
+          }
           if (sessionKey) {
             reflectionErrorStateBySession.delete(sessionKey);
           }
@@ -2861,13 +3175,29 @@ const memoryLanceDBProPlugin = {
         }
       };
 
-      api.registerHook("command:new", runMemoryReflection, {
+      api.registerHook("command:new", (event: any) => {
+        const eventSnapshot = snapshotReflectionHookEvent(event);
+        const timer = setTimeout(() => {
+          void runMemoryReflection(eventSnapshot).catch((err) => {
+            api.logger.warn(`memory-reflection: async command:new failed: ${String(err)}`);
+          });
+        }, 0);
+        timer.unref?.();
+      }, {
         name: "memory-lancedb-pro.memory-reflection.command-new",
-        description: "Generate reflection log before /new",
+        description: "Generate reflection log after /new without blocking the reply path",
       });
-      api.registerHook("command:reset", runMemoryReflection, {
+      api.registerHook("command:reset", (event: any) => {
+        const eventSnapshot = snapshotReflectionHookEvent(event);
+        const timer = setTimeout(() => {
+          void runMemoryReflection(eventSnapshot).catch((err) => {
+            api.logger.warn(`memory-reflection: async command:reset failed: ${String(err)}`);
+          });
+        }, 0);
+        timer.unref?.();
+      }, {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
-        description: "Generate reflection log before /reset",
+        description: "Generate reflection log after /reset without blocking the reply path",
       });
       api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_agent_start, before_prompt_build)");
     }
@@ -2998,6 +3328,9 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
 
     let backupTimer: ReturnType<typeof setInterval> | null = null;
+    let startupChecksTimer: ReturnType<typeof setTimeout> | null = null;
+    let legacyUpgradeNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+    let initialBackupTimer: ReturnType<typeof setTimeout> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
     async function runBackup() {
@@ -3053,6 +3386,8 @@ const memoryLanceDBProPlugin = {
     api.registerService({
       id: "memory-lancedb-pro",
       start: async () => {
+        await manualStoreQueue.start();
+
         // IMPORTANT: Do not block gateway startup on external network calls.
         // If embedding/retrieval tests hang (bad network / slow provider), the gateway
         // may never bind its HTTP port, causing restart timeouts.
@@ -3116,10 +3451,11 @@ const memoryLanceDBProPlugin = {
         };
 
         // Fire-and-forget: allow gateway to start serving immediately.
-        setTimeout(() => void runStartupChecks(), 0);
+        startupChecksTimer = setTimeout(() => void runStartupChecks(), 0);
+        startupChecksTimer.unref?.();
 
         // Check for legacy memories that could be upgraded
-        setTimeout(async () => {
+        legacyUpgradeNoticeTimer = setTimeout(async () => {
           try {
             const upgrader = createMemoryUpgrader(store, null);
             const counts = await upgrader.countLegacy();
@@ -3133,16 +3469,32 @@ const memoryLanceDBProPlugin = {
             // Non-critical: silently ignore
           }
         }, 5_000);
+        legacyUpgradeNoticeTimer.unref?.();
 
         // Run initial backup after a short delay, then schedule daily
-        setTimeout(() => void runBackup(), 60_000); // 1 min after start
+        initialBackupTimer = setTimeout(() => void runBackup(), 60_000); // 1 min after start
+        initialBackupTimer.unref?.();
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+        backupTimer.unref?.();
       },
       stop: async () => {
+        if (startupChecksTimer) {
+          clearTimeout(startupChecksTimer);
+          startupChecksTimer = null;
+        }
+        if (legacyUpgradeNoticeTimer) {
+          clearTimeout(legacyUpgradeNoticeTimer);
+          legacyUpgradeNoticeTimer = null;
+        }
+        if (initialBackupTimer) {
+          clearTimeout(initialBackupTimer);
+          initialBackupTimer = null;
+        }
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
         }
+        await manualStoreQueue.stop();
         api.logger.info("memory-lancedb-pro: stopped");
       },
     });

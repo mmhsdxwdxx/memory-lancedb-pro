@@ -11,6 +11,7 @@
 import OpenAI from "openai";
 import { createHash } from "node:crypto";
 import { smartChunk } from "./chunker.js";
+import { resolvePositiveIntEnv } from "./runtime-resilience.js";
 
 // ============================================================================
 // Embedding Cache (LRU with TTL)
@@ -99,7 +100,15 @@ export interface EmbeddingConfig {
   normalized?: boolean;
   /** Enable automatic chunking for documents exceeding context limits (default: true) */
   chunking?: boolean;
+  /** Internal safety timeout for embedding API calls (ms). */
+  timeoutMs?: number;
 }
+
+const DEFAULT_EMBED_TIMEOUT_MS = resolvePositiveIntEnv(
+  "MEMORY_LANCEDB_PRO_EMBED_TIMEOUT_MS",
+  15_000,
+  { min: 1_000, max: 120_000 },
+);
 
 // Known embedding model dimensions
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
@@ -286,6 +295,7 @@ export class Embedder {
   private readonly _requestDimensions?: number;
   /** Enable automatic chunking for long documents (default: true) */
   private readonly _autoChunk: boolean;
+  private readonly _timeoutMs: number;
 
   constructor(config: EmbeddingConfig & { chunking?: boolean }) {
     // Normalize apiKey to array and resolve environment variables
@@ -300,11 +310,15 @@ export class Embedder {
     this._requestDimensions = config.dimensions;
     // Enable auto-chunking by default for better handling of long documents
     this._autoChunk = config.chunking !== false;
+    this._timeoutMs = config.timeoutMs && config.timeoutMs > 0
+      ? config.timeoutMs
+      : DEFAULT_EMBED_TIMEOUT_MS;
 
     // Create a client pool — one OpenAI client per key
     this.clients = resolvedKeys.map(key => new OpenAI({
       apiKey: key,
       ...(config.baseURL ? { baseURL: config.baseURL } : {}),
+      timeout: this._timeoutMs,
     }));
 
     if (this.clients.length > 1) {

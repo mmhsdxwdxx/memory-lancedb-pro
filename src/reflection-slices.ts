@@ -74,6 +74,22 @@ export function isPlaceholderReflectionSliceLine(line: string): boolean {
   if (/apply this session'?s deltas next run/i.test(normalized)) return true;
   if (/apply this session'?s distilled changes next run/i.test(normalized)) return true;
   if (/investigate why embedded reflection generation failed/i.test(normalized)) return true;
+  if (isReflectionSystemMetaLine(normalized)) return true;
+  return false;
+}
+
+function isReflectionSystemMetaLine(line: string): boolean {
+  if (/\b(minimal|empty)\s+reflection\b/i.test(line)) return true;
+  if (/\breflection loop\b/i.test(line)) return true;
+  if (/\breflection (system|pipeline|input)\b/i.test(line)) return true;
+  if (/\bthis is the (first|second|third|fourth|fifth|\d+(?:st|nd|rd|th)) reflection\b/i.test(line)) return true;
+  if (/\bshort-?circuit\b/i.test(line) && /\breflection|same input|no delta|cycle\b/i.test(line)) return true;
+  if (/\bgate is needed\b/i.test(line)) return true;
+  if (/\bempty reflections?\b/i.test(line)) return true;
+  if (/\bproduce no new durable entries\b/i.test(line)) return true;
+  if (/\bnever generate fake reflection content\b/i.test(line)) return true;
+  if (/\bheartbeat cycles?\b/i.test(line) && /\buser interaction|reflection\b/i.test(line)) return true;
+  if (/\b(same input|identical to the previous cycle'?s input|no delta)\b/i.test(line) && /\breflection|cycle\b/i.test(line)) return true;
   return false;
 }
 

@@ -18,8 +18,10 @@ import {
   parseSmartMetadata,
   stringifySmartMetadata,
 } from "./smart-metadata.js";
+import type { ManualMemoryStorePayload, ManualMemoryStoreQueue } from "./manual-store-queue.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
 import { getDisplayCategoryTag } from "./reflection-metadata.js";
+import { formatErrorMessage, resolvePositiveIntEnv, runWithTimeout } from "./runtime-resilience.js";
 
 // ============================================================================
 // Types
@@ -53,7 +55,22 @@ interface ToolContext {
   agentId?: string;
   workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
+  manualStoreQueue?: ManualMemoryStoreQueue | null;
+  logger?: {
+    info?: (message: string) => void;
+    warn?: (message: string) => void;
+    error?: (message: string) => void;
+    debug?: (message: string) => void;
+  };
 }
+
+const DIRECT_MEMORY_STORE_TIMEOUT_MS = resolvePositiveIntEnv(
+  "MEMORY_LANCEDB_PRO_DIRECT_STORE_TIMEOUT_MS",
+  12_000,
+  { min: 1_000, max: 120_000 },
+);
+
+export interface PreparedManualMemoryStorePayload extends ManualMemoryStorePayload {}
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
   if (typeof runtimeAgentId === "string" && runtimeAgentId.trim().length > 0) return runtimeAgentId;
@@ -112,6 +129,179 @@ function resolveToolContext(
   return {
     ...base,
     agentId: resolveRuntimeAgentId(base.agentId, runtimeCtx),
+  };
+}
+
+export function prepareManualMemoryStorePayload(
+  runtimeContext: ToolContext,
+  params: {
+    text: string;
+    importance?: number;
+    category?: string;
+    scope?: string;
+  },
+):
+  | { immediateResult: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } }
+  | { payload: PreparedManualMemoryStorePayload } {
+  const {
+    text,
+    importance = 0.7,
+    category = "other",
+    scope,
+  } = params;
+
+  const agentId = runtimeContext.agentId;
+  const targetScope =
+    scope || runtimeContext.scopeManager.getDefaultScope(agentId);
+
+  if (!runtimeContext.scopeManager.isAccessible(targetScope, agentId)) {
+    return {
+      immediateResult: {
+        content: [
+          {
+            type: "text",
+            text: `Access denied to scope: ${targetScope}`,
+          },
+        ],
+        details: {
+          error: "scope_access_denied",
+          requestedScope: targetScope,
+        },
+      },
+    };
+  }
+
+  if (isNoise(text)) {
+    return {
+      immediateResult: {
+        content: [
+          {
+            type: "text",
+            text: "Skipped: text detected as noise (greeting, boilerplate, or meta-question)",
+          },
+        ],
+        details: { action: "noise_filtered", text: text.slice(0, 60) },
+      },
+    };
+  }
+
+  return {
+    payload: {
+      text,
+      importance: clamp01(importance, 0.7),
+      category,
+      scope: targetScope,
+      agentId,
+    },
+  };
+}
+
+export function buildQueuedMemoryStoreResult(
+  payload: PreparedManualMemoryStorePayload,
+  receipt: { id: string; queuedAt: number; position: number },
+) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `Queued memory for background storage in scope '${payload.scope}'`,
+      },
+    ],
+    details: {
+      action: "queued",
+      id: receipt.id,
+      scope: payload.scope,
+      category: payload.category,
+      importance: payload.importance,
+      queuedAt: receipt.queuedAt,
+      queuePosition: receipt.position,
+    },
+  };
+}
+
+export async function performManualMemoryStoreWrite(
+  runtimeContext: ToolContext,
+  payload: PreparedManualMemoryStorePayload,
+) {
+  const { text, importance, category, scope, agentId } = payload;
+  const vector = await runtimeContext.embedder.embedPassage(text);
+
+  let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
+  try {
+    existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [scope]);
+  } catch (error) {
+    runtimeContext.logger?.warn?.(
+      `memory-lancedb-pro: duplicate pre-check failed, continue store: ${formatErrorMessage(error)}`,
+    );
+  }
+
+  if (existing.length > 0 && existing[0].score > 0.98) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Similar memory already exists: "${existing[0].entry.text}"`,
+        },
+      ],
+      details: {
+        action: "duplicate",
+        existingId: existing[0].entry.id,
+        existingText: existing[0].entry.text,
+        existingScope: existing[0].entry.scope,
+        similarity: existing[0].score,
+      },
+    };
+  }
+
+  const entry = await runtimeContext.store.store({
+    text,
+    vector,
+    importance,
+    category: category as any,
+    scope,
+    metadata: stringifySmartMetadata(
+      buildSmartMetadata(
+        {
+          text,
+          category: category as any,
+          importance,
+        },
+        {
+          l0_abstract: text,
+          l1_overview: `- ${text}`,
+          l2_content: text,
+        },
+      ),
+    ),
+  });
+
+  if (runtimeContext.mdMirror) {
+    try {
+      await runtimeContext.mdMirror(
+        { text, category, scope, timestamp: entry.timestamp },
+        { source: "memory_store", agentId },
+      );
+    } catch (error) {
+      runtimeContext.logger?.warn?.(
+        `memory-lancedb-pro: mdMirror write skipped after successful memory_store: ${formatErrorMessage(error)}`,
+      );
+    }
+  }
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${scope}'`,
+      },
+    ],
+    details: {
+      action: "created",
+      id: entry.id,
+      scope: entry.scope,
+      category: entry.category,
+      importance: entry.importance,
+    },
   };
 }
 
@@ -545,140 +735,41 @@ export function registerMemoryStoreTool(
         ),
       }),
       async execute(_toolCallId, params) {
-        const {
-          text,
-          importance = 0.7,
-          category = "other",
-          scope,
-        } = params as {
-          text: string;
-          importance?: number;
-          category?: string;
-          scope?: string;
-        };
-
         try {
-          const agentId = runtimeContext.agentId;
-          // Determine target scope
-          let targetScope = scope || runtimeContext.scopeManager.getDefaultScope(agentId);
-
-          // Validate scope access
-          if (!runtimeContext.scopeManager.isAccessible(targetScope, agentId)) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Access denied to scope: ${targetScope}`,
-                },
-              ],
-              details: {
-                error: "scope_access_denied",
-                requestedScope: targetScope,
-              },
-            };
-          }
-
-          // Reject noise before wasting an embedding API call
-          if (isNoise(text)) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Skipped: text detected as noise (greeting, boilerplate, or meta-question)`,
-                },
-              ],
-              details: { action: "noise_filtered", text: text.slice(0, 60) },
-            };
-          }
-
-          const safeImportance = clamp01(importance, 0.7);
-          const vector = await runtimeContext.embedder.embedPassage(text);
-
-          // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-          // Fail-open by design: dedup must never block a legitimate memory write.
-          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
-          try {
-            existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
-              targetScope,
-            ]);
-          } catch (err) {
-            console.warn(
-              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
-            );
-          }
-
-          if (existing.length > 0 && existing[0].score > 0.98) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Similar memory already exists: "${existing[0].entry.text}"`,
-                },
-              ],
-              details: {
-                action: "duplicate",
-                existingId: existing[0].entry.id,
-                existingText: existing[0].entry.text,
-                existingScope: existing[0].entry.scope,
-                similarity: existing[0].score,
-              },
-            };
-          }
-
-          const entry = await runtimeContext.store.store({
-            text,
-            vector,
-            importance: safeImportance,
-            category: category as any,
-            scope: targetScope,
-            metadata: stringifySmartMetadata(
-              buildSmartMetadata(
-                {
-                  text,
-                  category: category as any,
-                  importance: safeImportance,
-                },
-                {
-                  l0_abstract: text,
-                  l1_overview: `- ${text}`,
-                  l2_content: text,
-                },
-              ),
-            ),
-          });
-
-          // Dual-write to Markdown mirror if enabled
-          if (context.mdMirror) {
-            await context.mdMirror(
-              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
-              { source: "memory_store", agentId },
-            );
-          }
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
-              },
-            ],
-            details: {
-              action: "created",
-              id: entry.id,
-              scope: entry.scope,
-              category: entry.category,
-              importance: entry.importance,
+          const prepared = prepareManualMemoryStorePayload(
+            runtimeContext,
+            params as {
+              text: string;
+              importance?: number;
+              category?: string;
+              scope?: string;
             },
-          };
+          );
+          if ("immediateResult" in prepared) {
+            return prepared.immediateResult;
+          }
+
+          if (runtimeContext.manualStoreQueue?.isActive()) {
+            const receipt = await runtimeContext.manualStoreQueue.enqueue(
+              prepared.payload,
+            );
+            return buildQueuedMemoryStoreResult(prepared.payload, receipt);
+          }
+
+          return await runWithTimeout(
+            () => performManualMemoryStoreWrite(runtimeContext, prepared.payload),
+            DIRECT_MEMORY_STORE_TIMEOUT_MS,
+            "memory_store direct write",
+          );
         } catch (error) {
           return {
             content: [
               {
                 type: "text",
-                text: `Memory storage failed: ${error instanceof Error ? error.message : String(error)}`,
+                text: `Memory storage failed: ${formatErrorMessage(error)}`,
               },
             ],
-            details: { error: "store_failed", message: String(error) },
+            details: { error: "store_failed", message: formatErrorMessage(error) },
           };
         }
       },

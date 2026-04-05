@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { resolvePositiveIntEnv, runWithTimeout } from "./runtime-resilience.js";
 
 // ============================================================================
 // Types
@@ -174,6 +175,16 @@ export function validateStoragePath(dbPath: string): string {
 // ============================================================================
 
 const TABLE_NAME = "memories";
+const DEFAULT_LANCEDB_INIT_TIMEOUT_MS = resolvePositiveIntEnv(
+  "MEMORY_LANCEDB_PRO_LANCEDB_INIT_TIMEOUT_MS",
+  10_000,
+  { min: 1_000, max: 120_000 },
+);
+const DEFAULT_LANCEDB_OP_TIMEOUT_MS = resolvePositiveIntEnv(
+  "MEMORY_LANCEDB_PRO_LANCEDB_OP_TIMEOUT_MS",
+  8_000,
+  { min: 500, max: 120_000 },
+);
 
 export class MemoryStore {
   private db: LanceDB.Connection | null = null;
@@ -196,7 +207,11 @@ export class MemoryStore {
       return this.initPromise;
     }
 
-    this.initPromise = this.doInitialize().catch((err) => {
+    this.initPromise = runWithTimeout(
+      () => this.doInitialize(),
+      DEFAULT_LANCEDB_INIT_TIMEOUT_MS,
+      `LanceDB init (${this.config.dbPath})`,
+    ).catch((err) => {
       this.initPromise = null;
       throw err;
     });
@@ -330,7 +345,11 @@ export class MemoryStore {
     };
 
     try {
-      await this.table!.add([fullEntry]);
+      await runWithTimeout(
+        () => this.table!.add([fullEntry]),
+        DEFAULT_LANCEDB_OP_TIMEOUT_MS,
+        `LanceDB store (${this.config.dbPath})`,
+      );
     } catch (err: any) {
       const code = err.code || "";
       const message = err.message || String(err);
@@ -377,11 +396,16 @@ export class MemoryStore {
   async hasId(id: string): Promise<boolean> {
     await this.ensureInitialized();
     const safeId = escapeSqlLiteral(id);
-    const res = await this.table!.query()
-      .select(["id"])
-      .where(`id = '${safeId}'`)
-      .limit(1)
-      .toArray();
+    const res = await runWithTimeout(
+      () =>
+        this.table!.query()
+          .select(["id"])
+          .where(`id = '${safeId}'`)
+          .limit(1)
+          .toArray(),
+      DEFAULT_LANCEDB_OP_TIMEOUT_MS,
+      `LanceDB hasId (${this.config.dbPath})`,
+    );
     return res.length > 0;
   }
 
@@ -389,11 +413,16 @@ export class MemoryStore {
     await this.ensureInitialized();
 
     const safeId = escapeSqlLiteral(id);
-    const rows = await this.table!
-      .query()
-      .where(`id = '${safeId}'`)
-      .limit(1)
-      .toArray();
+    const rows = await runWithTimeout(
+      () =>
+        this.table!
+          .query()
+          .where(`id = '${safeId}'`)
+          .limit(1)
+          .toArray(),
+      DEFAULT_LANCEDB_OP_TIMEOUT_MS,
+      `LanceDB getById (${this.config.dbPath})`,
+    );
 
     if (rows.length === 0) return null;
 
@@ -431,7 +460,11 @@ export class MemoryStore {
       query = query.where(`(${scopeConditions}) OR scope IS NULL`); // NULL for backward compatibility
     }
 
-    const results = await query.toArray();
+    const results = await runWithTimeout(
+      () => query.toArray(),
+      DEFAULT_LANCEDB_OP_TIMEOUT_MS,
+      `LanceDB vectorSearch (${this.config.dbPath})`,
+    );
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {

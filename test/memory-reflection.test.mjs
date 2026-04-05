@@ -15,8 +15,18 @@ const jiti = jitiFactory(import.meta.url, {
   },
 });
 
-const { readSessionConversationWithResetFallback, parsePluginConfig } = jiti("../index.ts");
-const { getDisplayCategoryTag } = jiti("../src/reflection-metadata.ts");
+const {
+  readSessionConversationWithResetFallback,
+  parsePluginConfig,
+  buildReflectionDedupKey,
+  acquireReflectionDedup,
+  settleReflectionDedup,
+  resetReflectionDedupRegistryForTests,
+  isMeaningfulReflectionOutput,
+  shouldUseCliReflectionFallback,
+} = jiti("../index.ts");
+const { getDisplayCategoryTag, isReflectionRecallExcludedEntry } = jiti("../src/reflection-metadata.ts");
+const { extractReflectionSlices } = jiti("../src/reflection-slices.ts");
 const {
   classifyReflectionRetry,
   computeReflectionRetryDelayMs,
@@ -76,6 +86,48 @@ function baseConfig() {
 }
 
 describe("memory reflection", () => {
+  afterEach(() => {
+    resetReflectionDedupRegistryForTests();
+  });
+
+  describe("reflection dedup registry", () => {
+    it("blocks duplicate command runs after the first run starts or finishes", () => {
+      const key = buildReflectionDedupKey({
+        scope: "command",
+        action: "new",
+        agentId: "main",
+        sessionId: "sess-1",
+      });
+
+      assert.equal(key, "command::new::agent:main::session-id:sess-1");
+      assert.deepEqual(acquireReflectionDedup(key), { acquired: true });
+      assert.deepEqual(acquireReflectionDedup(key), { acquired: false, reason: "running" });
+
+      settleReflectionDedup(key, "completed");
+      assert.deepEqual(acquireReflectionDedup(key), { acquired: false, reason: "completed" });
+    });
+
+    it("releases failed runs and refuses command-level fallback to static sessionKey", () => {
+      const badFallbackKey = buildReflectionDedupKey({
+        scope: "command",
+        action: "new",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+      });
+      assert.equal(badFallbackKey, "");
+
+      const key = buildReflectionDedupKey({
+        scope: "command",
+        action: "reset",
+        agentId: "main",
+        sessionId: "sess-2",
+      });
+      assert.deepEqual(acquireReflectionDedup(key), { acquired: true });
+      settleReflectionDedup(key, "failed");
+      assert.deepEqual(acquireReflectionDedup(key), { acquired: true });
+    });
+  });
+
   describe("command:new/reset session fallback helper", () => {
     let workDir;
 
@@ -191,6 +243,44 @@ describe("memory reflection", () => {
           metadata: "{}",
         }),
         "fact:global"
+      );
+    });
+
+    it("excludes reflection-derived rows from ordinary recall injection", () => {
+      assert.equal(
+        isReflectionRecallExcludedEntry({
+          category: "reflection",
+          metadata: JSON.stringify({ type: "memory-reflection" }),
+        }),
+        true,
+      );
+      assert.equal(
+        isReflectionRecallExcludedEntry({
+          category: "fact",
+          metadata: JSON.stringify({ type: "memory-reflection-event" }),
+        }),
+        true,
+      );
+      assert.equal(
+        isReflectionRecallExcludedEntry({
+          category: "decision",
+          metadata: JSON.stringify({ type: "memory-reflection-item", itemKind: "derived" }),
+        }),
+        true,
+      );
+      assert.equal(
+        isReflectionRecallExcludedEntry({
+          category: "preference",
+          metadata: JSON.stringify({ type: "memory-reflection-mapped", mappedKind: "user-model" }),
+        }),
+        true,
+      );
+      assert.equal(
+        isReflectionRecallExcludedEntry({
+          category: "fact",
+          metadata: JSON.stringify({ type: "ordinary-memory-row" }),
+        }),
+        false,
       );
     });
   });
@@ -481,6 +571,60 @@ describe("memory reflection", () => {
       const meta = JSON.parse(storedEntries[0].metadata);
       assert.equal(meta.type, "memory-reflection-event");
       assert.equal(meta.usedFallback, true);
+    });
+  });
+
+  describe("reflection signal filtering", () => {
+    it("filters reflection self-meta lines from slices before prompt injection", () => {
+      const slices = extractReflectionSlices([
+        "## Invariants",
+        "- When session has only heartbeat cycles with no user interaction, produce minimal reflection without inventing content",
+        "- Always keep replies concise for this user.",
+        "## Derived",
+        "- This is the third reflection on the same input with no delta - the reflection loop should short-circuit",
+        "- Next run verify the user still wants concise replies.",
+      ].join("\n"));
+
+      assert.deepEqual(slices.invariants, ["Always keep replies concise for this user."]);
+      assert.deepEqual(slices.derived, ["Next run verify the user still wants concise replies."]);
+    });
+
+    it("treats placeholder-only reflection output as non-meaningful", () => {
+      const emptyReflection = [
+        "## Invariants",
+        "- (none captured)",
+        "## Derived",
+        "- This is the third reflection on the same input with no delta - the reflection loop should short-circuit",
+      ].join("\n");
+
+      const usefulReflection = [
+        "## Invariants",
+        "- Always confirm the target path before editing.",
+        "## Derived",
+        "- Next run verify the gateway log after restart.",
+      ].join("\n");
+
+      assert.equal(isMeaningfulReflectionOutput(emptyReflection), false);
+      assert.equal(isMeaningfulReflectionOutput(usefulReflection), true);
+    });
+
+    it("only allows CLI fallback when embedded runtime is unavailable", () => {
+      assert.equal(
+        shouldUseCliReflectionFallback("embedded: Error: Unable to load OpenClaw embedded runtime API. Set OPENCLAW_EXTENSION_API_PATH if runtime layout differs."),
+        true,
+      );
+      assert.equal(
+        shouldUseCliReflectionFallback("embedded: Error: embedded reflection run timed out after 25000ms"),
+        false,
+      );
+      assert.equal(
+        shouldUseCliReflectionFallback("embedded: Error: Model returned an empty visible reply."),
+        false,
+      );
+      assert.equal(
+        shouldUseCliReflectionFallback(undefined),
+        false,
+      );
     });
   });
 
