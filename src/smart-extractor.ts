@@ -439,13 +439,14 @@ export class SmartExtractor {
     }>(prompt, "extract-candidates");
 
     if (!result) {
-      this.debugLog(
-        "memory-lancedb-pro: smart-extractor: extract-candidates returned null",
+      const lastErr = this.llm.getLastError();
+      this.log(
+        `memory-lancedb-pro: smart-extractor: extract-candidates returned null (model may have returned non-JSON or empty)${lastErr ? ` — ${lastErr}` : ""}`,
       );
       return [];
     }
     if (!result.memories || !Array.isArray(result.memories)) {
-      this.debugLog(
+      this.log(
         `memory-lancedb-pro: smart-extractor: extract-candidates returned unexpected shape keys=${Object.keys(result).join(",") || "(none)"}`,
       );
       return [];
