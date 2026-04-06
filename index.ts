@@ -1931,6 +1931,7 @@ const memoryLanceDBProPlugin = {
           oauthProvider: llmOauthProvider,
           oauthPath: llmOauthPath,
           timeoutMs: llmTimeoutMs,
+          maxTokens: config.llm?.maxTokens,
           log: (msg: string) => api.logger.debug(msg),
           warnLog: (msg: string) => api.logger.warn(msg),
         });
@@ -2384,6 +2385,7 @@ const memoryLanceDBProPlugin = {
               oauthProvider: llmOauthProvider,
               oauthPath: llmOauthPath,
               timeoutMs: llmTimeoutMs,
+              maxTokens: config.llm?.maxTokens,
               log: (msg: string) => api.logger.debug(msg),
             });
           } catch { return undefined; }

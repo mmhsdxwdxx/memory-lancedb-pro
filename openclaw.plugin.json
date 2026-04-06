@@ -717,6 +717,12 @@
             "type": "integer",
             "minimum": 500,
             "default": 30000
+          },
+          "maxTokens": {
+            "type": "integer",
+            "minimum": 256,
+            "default": 4096,
+            "description": "Maximum tokens for LLM completion responses. Increase if memory extraction JSON is truncated."
           }
         }
       },

@@ -10,6 +10,8 @@ export interface LlmClientConfig {
   model: string;
   baseURL?: string;
   timeoutMs?: number;
+  /** Maximum tokens for LLM completion responses. Defaults to 4096 when unset. */
+  maxTokens?: number;
   log?: (msg: string) => void;
   /** Warn-level logger for user-visible failures (timeouts, retries, network errors). */
   warnLog?: (msg: string) => void;
@@ -96,6 +98,7 @@ export function createLlmClient(config: LlmClientConfig): LlmClient {
             { role: "user", content: prompt },
           ],
           temperature: 0.1,
+          max_completion_tokens: config.maxTokens ?? 4096,
         });
 
         const raw = response.choices?.[0]?.message?.content;
